@@ -164,6 +164,161 @@ CONFIG_MT76x2_COMMON=m
 CONFIG_MT76x2U=m
 ```
 
+## Finding and extracting the NVIDIA kernel source
+
+The official source archive for L4T 36.4.3 is `public_sources.tbz2` from the
+[Jetson Linux 36.4.3 release](https://developer.nvidia.com/embedded/jetson-linux-r3643).
+It is a bzip2-compressed tar archive containing several nested source archives.
+The kernel archive can be found by listing the outer archive; extracting the
+whole outer archive is unnecessary.
+
+These are the commands used on PC2:
+
+```bash
+mkdir -p /home/unitree/pc2/mt76-build
+cd /home/unitree/pc2/mt76-build
+
+curl -fL -o public_sources.tbz2 \
+  https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.3/sources/public_sources.tbz2
+bzip2 -t public_sources.tbz2
+
+tar -tjf public_sources.tbz2 | grep -E '(^|/)kernel_src[.]tbz2$'
+# Linux_for_Tegra/source/kernel_src.tbz2
+
+tar -xjf public_sources.tbz2 \
+  Linux_for_Tegra/source/kernel_src.tbz2
+
+mkdir -p source
+tar -xjf Linux_for_Tegra/source/kernel_src.tbz2 -C source
+
+test -d source/kernel/kernel-jammy-src
+make -s -C source/kernel/kernel-jammy-src kernelversion
+```
+
+The first `tar` invocation only lists member names. The second selectively
+extracts the approximately 149 MiB nested kernel archive. Only the final
+command expands the kernel source, under `source/kernel/kernel-jammy-src`.
+No throwaway extraction directory was needed to discover the member.
+
+## Building for L4T 36.5 from a 36.4.3 Jetson
+
+This is possible because both systems are aarch64. The build host's running
+kernel does not need to match the target, but all target build inputs must
+match each other exactly:
+
+- L4T 36.5.0 source archive: `r36_release_v5.0`.
+- Target kernel: `5.15.185-tegra`.
+- Target production `.config` and `Module.symvers` from
+  `nvidia-l4t-kernel-headers_5.15.185-tegra-36.5.0-20260115194252_arm64.deb`.
+- An aarch64 compiler and the normal kernel build dependencies.
+
+On Ubuntu, the preparation requires `curl`, `bzip2`, `dpkg`, and `kmod`; the
+kernel build requires the usual `build-essential`, `bc`, `flex`, `bison`,
+`libssl-dev`, `libelf-dev`, and `zstd` packages. NVIDIA documents the core
+prerequisites in its [L4T 36.5 kernel customization guide](https://docs.nvidia.com/jetson/archives/r36.5/DeveloperGuide/SD/Kernel/KernelCustomization.html).
+
+Do not install the 36.5 header or kernel package on the running 36.4.3 robot.
+Extract the header `.deb` into an isolated directory with `dpkg-deb -x`. The
+target `Module.symvers` is essential because NVIDIA enables
+`CONFIG_MODVERSIONS`.
+
+The included script performs the isolated download and preparation, without
+writing to `/lib/modules`:
+
+```bash
+./scripts/prepare_l4t_kernel_tree.sh \
+  --work-dir /home/unitree/pc2/mt76-build-r36.5 \
+  --jobs 8
+```
+
+Add `--build-mt76` to build and collect the six modules:
+
+```bash
+./scripts/prepare_l4t_kernel_tree.sh \
+  --work-dir /home/unitree/pc2/mt76-build-r36.5 \
+  --jobs 8 \
+  --build-mt76
+```
+
+Output is written to:
+
+```text
+/home/unitree/pc2/mt76-build-r36.5/output/5.15.185-tegra/aarch64/
+```
+
+Those modules cannot be loaded on `5.15.148-tegra`; they are artifacts for a
+machine actually running the matching `5.15.185-tegra` NVIDIA package. The
+current r36.5 repository also contains L4T 36.5.2 with kernel
+`5.15.199-tegra`, which is a different ABI and requires a separate build.
+
+## Inspecting NVIDIA's Debian repositories without apt
+
+For this source line:
+
+```text
+deb https://repo.download.nvidia.com/jetson/t234 r36.5 main
+```
+
+Debian repository fields map to the metadata URL as follows:
+
+```text
+BASE/dists/SUITE/COMPONENT/binary-ARCH/Packages.gz
+```
+
+Therefore the t234 ARM64 index is:
+
+```text
+https://repo.download.nvidia.com/jetson/t234/dists/r36.5/main/binary-arm64/Packages.gz
+```
+
+NVIDIA splits packages between `common` and `t234`, so query both indexes:
+
+```bash
+suite=r36.5
+arch=arm64
+
+for repo in common t234; do
+  curl -fsSL \
+    "https://repo.download.nvidia.com/jetson/$repo/dists/$suite/main/binary-$arch/Packages.gz" |
+    gzip -dc |
+    awk -v repo="$repo" '
+      BEGIN { RS=""; FS="\n" }
+      {
+        package=""; version=""; size=""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Package: /) package=substr($i, 10)
+          if ($i ~ /^Version: /) version=substr($i, 10)
+          if ($i ~ /^Size: /) size=substr($i, 7)
+        }
+        if (package != "") print repo, package, version, size
+      }
+    '
+done | sort -u
+```
+
+Print the complete metadata for all available kernel-header versions:
+
+```bash
+curl -fsSL \
+  https://repo.download.nvidia.com/jetson/t234/dists/r36.5/main/binary-arm64/Packages.gz |
+  gzip -dc |
+  awk '
+    BEGIN { RS=""; FS="\n" }
+    {
+      for (i = 1; i <= NF; i++)
+        if ($i == "Package: nvidia-l4t-kernel-headers") {
+          print $0 "\n"
+          break
+        }
+    }
+  '
+```
+
+Each stanza provides `Filename`, `Size`, and `SHA256`, allowing direct download
+and verification without `apt`. `Packages.gz` is only the catalog. For full
+repository authentication, also fetch and verify the suite's `InRelease` file
+with NVIDIA's repository signing key before trusting package hashes.
+
 ## Licensing
 
 The matching NVIDIA source contains MT76 files under GPL-2.0 and ISC SPDX
